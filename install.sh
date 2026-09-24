@@ -61,20 +61,13 @@ if [ "$MATCHED" -eq 1 ]; then
 else
     echo -e "${RED}[WARN] 警告：当前镜像 '$CURRENT_IMAGE' 未在经过严格兼容性认证的列表中！${NC}"
     echo -e "${YELLOW}已认证支持的镜像为: ${SUPPORTED_IMAGES[*]}${NC}"
-    echo -e "${YELLOW}其他镜像可能存在内部 Web 端口差异、网络命名空间不同或不支持 cgroups freezer 的风险。${NC}"
     
-    # 支持 SKIP_IMAGE_CHECK=true 环境变量强制跳过
     if [ "${SKIP_IMAGE_CHECK:-false}" != "true" ]; then
         if [ -t 0 ]; then
             read -r -p "是否仍然强制继续安装？[y/N]: " choice
             case "$choice" in
-                [yY][eE][sS]|[yY])
-                    echo -e "${YELLOW}用户选择强制继续安装...${NC}"
-                    ;;
-                *)
-                    echo -e "${RED}[ABORT] 安装已由用户终止。${NC}"
-                    exit 1
-                    ;;
+                [yY][eE][sS]|[yY]) echo -e "${YELLOW}用户选择强制继续安装...${NC}" ;;
+                *) echo -e "${RED}[ABORT] 安装已由用户终止。${NC}"; exit 1 ;;
             esac
         else
             echo -e "${RED}[ERROR] 非交互模式下镜像不匹配，安装终止。如需强制安装，请设置 export SKIP_IMAGE_CHECK=true${NC}"
@@ -85,14 +78,61 @@ else
     fi
 fi
 
-# 5. 创建安装目录并安装 sentinel.py
-echo -e "${YELLOW}[1/4] 部署后台看门狗守护程序...${NC}"
+# 5. 探查环境是否存在 Nginx 反向代理
+echo -e "${YELLOW}[1/4] 检测网络拓扑与反向代理环境...${NC}"
+NGINX_CONF=""
+SEARCH_DIRS=("/home/web/conf.d" "/etc/nginx/conf.d" "/etc/nginx/sites-enabled" "/www/server/panel/vhost/nginx")
+
+for d in "${SEARCH_DIRS[@]}"; do
+    if [ -d "$d" ]; then
+        FOUND=$(grep -rn "127.0.0.1:$DEFAULT_WEB_PORT" "$d" 2>/dev/null | head -n 1 | cut -d: -f1 || true)
+        if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
+            NGINX_CONF="$FOUND"
+            break
+        fi
+    fi
+done
+
+ENABLE_DIRECT="false"
+DIRECT_PORT="$DEFAULT_WEB_PORT"
+BACKEND_PORT="58000"
+
+if [ -n "$NGINX_CONF" ]; then
+    echo -e "${GREEN}[OK] 检测到已配置的 Nginx 反向代理: $NGINX_CONF${NC}"
+    MODE="nginx"
+else
+    echo -e "${YELLOW}[INFO] 未检测到反代 $DEFAULT_WEB_PORT 的 Nginx 配置文件。${NC}"
+    echo -e "${GREEN}--> 自动启用【直连模式 / 透明网桥唤醒】 (无需反向代理，直接访问 IP:$DEFAULT_WEB_PORT 即可自动唤醒)${NC}"
+    MODE="direct"
+    ENABLE_DIRECT="true"
+
+    # 在直连模式下，需要将容器现有映射端口避让给 sentinel 透明网桥
+    HOST_BINDING=$(docker inspect "$CONTAINER_NAME" --format '{{range $p, $conf := .HostConfig.PortBindings}}{{if eq $p "5800/tcp"}}{{(index $conf 0).HostPort}}{{end}}{{end}}' 2>/dev/null || true)
+    if [ "$HOST_BINDING" = "5800" ]; then
+        echo -e "${YELLOW}检测到容器直接占用了宿主机 5800 端口。正在调整映射至内部 58000 端口以启用自愈透明网桥...${NC}"
+        # 获取原有容器创建配置
+        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        # 兼容性热修改 hostconfig.json 端口映射
+        CONTAINER_ID=$(docker inspect "$CONTAINER_NAME" --format '{{.Id}}')
+        CONFIG_FILE="/var/lib/docker/containers/${CONTAINER_ID}/hostconfig.json"
+        if [ -f "$CONFIG_FILE" ]; then
+            systemctl stop docker
+            sed -i 's/"5800\/tcp":\[{"HostIp":"","HostPort":"5800"}\]/"5800\/tcp":[{"HostIp":"127.0.0.1","HostPort":"58000"}]/g' "$CONFIG_FILE"
+            systemctl start docker
+            docker start "$CONTAINER_NAME" >/dev/null 2>&1
+            echo -e "${GREEN}[OK] 端口已安全平移至内部 127.0.0.1:58000，外部 5800 交由智能看门狗监听！${NC}"
+        fi
+    fi
+fi
+
+# 6. 创建安装目录并安装 sentinel.py
+echo -e "${YELLOW}[2/4] 部署后台看门狗守护程序...${NC}"
 mkdir -p "$INSTALL_DIR"
 
 if [ -f "$(dirname "$0")/sentinel.py" ]; then
     cp "$(dirname "$0")/sentinel.py" "$INSTALL_DIR/sentinel.py"
 else
-    REPO_USER="${GITHUB_USER:-YOUR_USERNAME}"
+    REPO_USER="${GITHUB_USER:-redcats2}"
     REPO_NAME="baidunetdisk-reduceCPUusage"
     echo "从远程源拉取 sentinel.py..."
     curl -sSL -o "$INSTALL_DIR/sentinel.py" "https://raw.githubusercontent.com/$REPO_USER/$REPO_NAME/main/sentinel.py" || {
@@ -102,8 +142,8 @@ else
 fi
 chmod +x "$INSTALL_DIR/sentinel.py"
 
-# 6. 注册并启动 Systemd 服务
-echo -e "${YELLOW}[2/4] 配置并启动 Systemd 守护服务...${NC}"
+# 7. 注册并启动 Systemd 服务
+echo -e "${YELLOW}[3/4] 配置并启动 Systemd 守护服务...${NC}"
 cat <<EOF > /etc/systemd/system/${SERVICE_NAME}.service
 [Unit]
 Description=BaiduNetdisk ReduceCPUusage Service
@@ -122,6 +162,9 @@ Environment=REDUCECPU_WAKE_PORT=$DEFAULT_WAKE_PORT
 Environment=REDUCECPU_WEB_PORT=$DEFAULT_WEB_PORT
 Environment=REDUCECPU_SPEED_KB=30
 Environment=REDUCECPU_IDLE_SECONDS=180
+Environment=REDUCECPU_DIRECT_PROXY=$ENABLE_DIRECT
+Environment=REDUCECPU_DIRECT_PORT=$DIRECT_PORT
+Environment=REDUCECPU_BACKEND_PORT=$BACKEND_PORT
 
 [Install]
 WantedBy=multi-user.target
@@ -131,31 +174,13 @@ systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
 echo -e "${GREEN}[OK] 守护服务已成功启动！${NC}"
 
-# 7. 配置 Nginx 反向代理
-echo -e "${YELLOW}[3/4] 检查并配置 Nginx 反向代理唤醒钩子...${NC}"
-
-NGINX_CONF=""
-SEARCH_DIRS=("/home/web/conf.d" "/etc/nginx/conf.d" "/etc/nginx/sites-enabled" "/www/server/panel/vhost/nginx")
-
-for d in "${SEARCH_DIRS[@]}"; do
-    if [ -d "$d" ]; then
-        FOUND=$(grep -rn "127.0.0.1:$DEFAULT_WEB_PORT" "$d" 2>/dev/null | head -n 1 | cut -d: -f1 || true)
-        if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
-            NGINX_CONF="$FOUND"
-            break
-        fi
-    fi
-done
-
-if [ -n "$NGINX_CONF" ]; then
-    echo -e "找到匹配的 Nginx 配置文件: ${GREEN}$NGINX_CONF${NC}"
-    
+# 8. 如果是 Nginx 模式，配置 Nginx 钩子
+if [ "$MODE" = "nginx" ]; then
+    echo -e "${YELLOW}[4/4] 配置 Nginx 反向代理唤醒钩子...${NC}"
     if grep -q "_wake_reducecpu" "$NGINX_CONF" || grep -q "_wake_sentinel" "$NGINX_CONF"; then
         echo -e "${YELLOW}Nginx 配置已经包含唤醒钩子，跳过修改。${NC}"
     else
         cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-        echo "已备份原配置到: ${NGINX_CONF}.bak.*"
-
         awk '
         /\/_wake_reducecpu/ { found=1 }
         /location \/ \{/ && !injected {
@@ -189,18 +214,13 @@ if [ -n "$NGINX_CONF" ]; then
             docker exec nginx nginx -t && docker exec nginx nginx -s reload && echo -e "${GREEN}[OK] Docker Nginx 配置已更新并重载生效！${NC}"
         elif command -v nginx >/dev/null 2>&1; then
             nginx -t && systemctl reload nginx && echo -e "${GREEN}[OK] 系统 Nginx 配置已更新并重载生效！${NC}"
-        else
-            echo -e "${YELLOW}[WARN] 未能自动重启 Nginx，请手动重载 Nginx 以使补丁生效。${NC}"
         fi
     fi
 else
-    echo -e "${YELLOW}[INFO] 未自动定位到反代 127.0.0.1:$DEFAULT_WEB_PORT 的 Nginx 配置文件。${NC}"
-    echo -e "${YELLOW}请手动在对应域名的 Nginx location / 下添加:${NC}"
-    echo -e "    auth_request /_wake_reducecpu;"
-    echo -e "    location = /_wake_reducecpu { internal; proxy_pass http://127.0.0.1:$DEFAULT_WAKE_PORT; }"
+    echo -e "${GREEN}[4/4] 直连模式安装就绪，无需修改 Nginx。${NC}"
 fi
 
-# 8. 生成一键卸载脚本
+# 9. 生成一键卸载脚本
 cat << 'EOF' > "$INSTALL_DIR/uninstall.sh"
 #!/bin/bash
 set -e
@@ -212,6 +232,20 @@ systemctl daemon-reload
 
 echo "正在确保容器处于解冻唤醒状态..."
 docker unpause baidunetdisk 2>/dev/null || true
+
+# 检查是否平移过直连端口
+CONTAINER_ID=$(docker inspect baidunetdisk --format '{{.Id}}' 2>/dev/null || true)
+CONFIG_FILE="/var/lib/docker/containers/${CONTAINER_ID}/hostconfig.json"
+if [ -n "$CONTAINER_ID" ] && [ -f "$CONFIG_FILE" ]; then
+    if grep -q "58000" "$CONFIG_FILE"; then
+        echo "还原直连端口映射..."
+        docker stop baidunetdisk >/dev/null 2>&1 || true
+        systemctl stop docker
+        sed -i 's/"5800\/tcp":\[{"HostIp":"127.0.0.1","HostPort":"58000"}\]/"5800\/tcp":[{"HostIp":"","HostPort":"5800"}]/g' "$CONFIG_FILE"
+        systemctl start docker
+        docker start baidunetdisk >/dev/null 2>&1
+    fi
+fi
 
 echo "寻找 Nginx 备份文件..."
 for bak in /home/web/conf.d/*.conf.bak* /etc/nginx/conf.d/*.conf.bak*; do
@@ -233,13 +267,14 @@ echo "=== BaiduNetdisk ReduceCPUusage 卸载完成，已彻底恢复初始状态
 EOF
 chmod +x "$INSTALL_DIR/uninstall.sh"
 
-echo -e "${YELLOW}[4/4] 验证容器状态...${NC}"
-docker inspect "$CONTAINER_NAME" --format '容器当前状态: {{.State.Status}}'
-
 echo -e "\n${GREEN}================================================================${NC}"
 echo -e "${GREEN}  恭喜！BaiduNetdisk ReduceCPUusage 补丁已安装就绪！            ${NC}"
 echo -e "${GREEN}================================================================${NC}"
+echo -e "当前运行模式: ${GREEN}${MODE}${NC}"
+if [ "$MODE" = "direct" ]; then
+    echo -e "直连访问地址: http://<你的服务器IP>:5800 (首包 TCP 自动无感拉起唤醒)"
+fi
 echo -e "功能说明："
 echo -e " 1. 无下载 (<30KB/s) 且连续 3 分钟无网页访问时，容器自动暂停 (CPU 0.00%)"
-echo -e " 2. 浏览器打开网盘页面时，毫秒级无感唤醒"
+echo -e " 2. 网页访问时，毫秒级无感唤醒"
 echo -e " 3. 如需彻底卸载并恢复原状，只需执行: bash $INSTALL_DIR/uninstall.sh\n"

@@ -32,7 +32,7 @@
 在宿主机上执行以下单行命令即可自动完成部署：
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/<YOUR_USERNAME>/baidunetdisk-reduceCPUusage/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/redcats2/baidunetdisk-reduceCPUusage/main/install.sh | bash
 ```
 
 *(若本地已有源码，亦可在项目根目录直接执行 `sudo bash install.sh`)*
